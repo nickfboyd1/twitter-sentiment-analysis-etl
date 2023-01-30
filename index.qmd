@@ -1,0 +1,466 @@
+---
+title: Twitter ETL & Sentiment Analysis
+date: January 2023
+categories:
+  - Python
+  - Tweepy
+  - Sentiment Analysis
+  - Machine Learning
+  - NLP
+image: image.jpg
+format:
+  html:
+    code-fold: true
+jupyter: python3
+---
+
+# Twitter ETL & Sentiment Analysis
+
+## Overview
+
+The goal of this post is to demonstrate how we can use Twitter's API & Python's primary natural-language processing (NLP) libraries to easily analyze the overall sentiment of recent tweets on any given subject. 
+
+Additionally, I'll show how to load this data into a SQL database or S3 bucket on AWS. This type of ETL or data pipeline would likely be necessary in the case that I wanted to continously maintain and analyze a larger list of tweets over time, or in a professional setting where multiple analysts and engineers need to access to the data.
+
+The code and analysis below will cover the following topics:
+- Extracting tweets from the Twitter API using a Python library called Tweepy
+- Transforming the tweets data into a pandas dataframe for ease of analysis
+- Cleaning and pre-processing unstructured, unlabeled text data
+- Loading the cleaned, tweet dataframe into a SQL database or Amazon S3 bucket.
+- Executing sentiment analysis using libraries like scikit-learn and transformers
+
+The source code can be found in my GitHub profile [here]().
+
+## *1) Setup*
+
+```{python}
+### Load libraries
+
+# Twitter
+import tweepy
+
+# Data analysis
+import pandas as pd
+import numpy as np
+
+# SQL
+import sqlite3
+
+# Regex
+import re
+
+# Environment variables
+from decouple import config
+
+# AWS S3 Upload
+from datetime import date
+import boto3
+import io
+
+# Text analytics
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+from nltk.corpus import stopwords
+
+from sklearn.feature_extraction.text import CountVectorizer
+import altair as alt
+from textblob import TextBlob
+from transformers import pipeline, set_seed
+
+# Configure environment variables
+BEARER_TOKEN = config('BEARER_TOKEN')
+AWS_ACCESS_KEY_ID = config('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = config('AWS_SECRET_ACCESS_KEY')
+
+# Warnings
+import warnings
+warnings.filterwarnings(action='once')
+```
+
+The last few lines of code above relates to the environment variables I have stored in a separate .env file. These include my Twitter API bearer token as well as my AWS credentials. Using the python-decouple library, I can simply assign this confidential information to new local variables in this file. In managing the bearer token and AWS keys this way, I'm able to make requests to the Twitter API, upload data to AWS, share my source code, and keep my accounts secure.
+
+I highly recommend [this article](https://able.bio/rhett/how-to-set-and-get-environment-variables-in-python--274rgt5) for a quick example of how to use python-decouple for this use case.  
+
+## *2) Extract*
+
+First I will initialize the tweepy client with my bearer_token. A bearer token is a type of authentication access token used for the OAuth 2.0 protocol. In simpler terms, it's a unique string that helps Twitter associate the API requests I make with my Twitter Developer account. 
+
+Next, I define the query (term to search for on Twitter) as 'USMNT', an acronym for the United States Men's National Soccer Team. US Soccer has undergone some significant internal turmoil since the 2022 World Cup. As a lifelong, die-hard fan of the team, I want to know how people feel about the resignation of two major executives and the investigation into former manager, Greg Berhalter. I also will specify in the query that I only want to see tweets in english and retweets should be excluded.
+
+Using the search_recent_tweets Tweepy function, along with my defined twitter_query, I can start extracting relevant tweets. I'll also include the following parameters:
+- tweet_fields: a list of tweet-specific fields I want be to be returned for each matching tweet object. 
+- user_fields: a list of user-specific fields I want to be returned for each matching tweet object.
+- max_results: the number of matching tweets to be returned. This number defaults to 10 and is capped at 100.
+
+The Tweepy client then makes a HTTP request to the search_recent_tweets endpoint (https://api.twitter.com/2/tweets/search/recent). Assuming I have passed in a valid bearer_token and the parameters I included adhere to the Twitter API & Tweepy documentation, the endpoint will return a list of 100 tweet objects.
+
+```{python}
+# Initialize Tweepy client with bearer_token
+client = tweepy.Client(bearer_token=BEARER_TOKEN)
+
+# Build twitter query - lowercase string, ensure no retweets are included, limit to english
+twitter_query = "USMNT -is:retweet lang: en"
+
+# Get tweets and save to new 'tweets' object
+tweets = client.search_recent_tweets(query=twitter_query,
+                                    tweet_fields=['context_annotations','created_at', 'public_metrics', 'possibly_sensitive', 'source'],
+                                     user_fields=['username'],
+                                     max_results=100)
+
+# Extract the actual tweet data from the Tweepy tweets object
+tweets_data = tweets.data
+```
+
+Next, I'll inspect the tweet attributes I'm interested in for the first 3 tweets. These are:
+- created_at - time of tweet
+- text - tweet contents) 
+- public_metrics - public tweet metrics: number of retweets, replies, likes and quotes) 
+- possibly_sensitive - a flag used to identify any potentially sensitive tweets
+- source - how the tweet was created (phone, desktop, etc.)
+
+```{python}
+# Loop through tweets_data and print results
+for number, each in enumerate(tweets_data[0:3]):
+    print(f" \
+            Tweet {number} time: {each.created_at}\n \
+            Tweet {number} text: {each.text.strip()}\n \
+            Tweet {number} metrics: {each.public_metrics}\n \
+            Tweet {number} possibily_sensitive?:  {each.possibly_sensitive}\n \
+            Tweet {number} source: {each.source}\n")
+```
+
+## *3) Transform*
+
+Its important to note that the data returned from the Twitter API comes in JSON format, which is not the same as tabular data.
+
+For example, the 'tweets' object contains the following objects:
+- data - a list of tweets and the attributes I printed above
+- meta - Metadata such as newest tweet id in the response, oldest tweet id in the response, number of results returned, and the next token/page of tweets.
+
+The data cannot be easily analyzed in it's current form (at least not using pandas). Therefore, I'll now execute a series of steps designed to clean and transform the data into a structure that's easier to work with: a dataframe.
+
+To do this, I use list comprehension, which allows me to iterate through the list of tweets, saving each tweet value I care about to a new vector. Then I combine the 5 vectors into a pandas dataframe, which is printed below.
+
+```{python}
+# Save results in dataframe
+tweet_id = [each["id"] for each in tweets_data]
+tweets = [each["text"] for each in tweets_data]
+metrics = [each["public_metrics"] for each in tweets_data] 
+sensitive = [each["possibly_sensitive"] for each in tweets_data] 
+source = [each["source"] for each in tweets_data] 
+
+# Save to df
+df = pd.DataFrame({
+    "tweet_id":tweet_id,
+    "tweets":tweets,
+    "metrics":metrics,
+    "sensitive":sensitive,
+    "source":source
+      
+})
+
+# Inspect
+df.head()
+```
+
+This isn't quite what I need, because the public_metrics values were stored as a dictionary and therefore not in separate columns in the dataframe. Below, I'll update the dataframe to fix this issue.
+
+```{python}
+# Separate metrics dictionary to columns
+metrics_cols = df["metrics"].apply(pd.Series)
+
+# Add metrics columns to df
+df = df.join(metrics_cols)
+
+# Drop original metrics column
+df = df.drop(columns=["metrics"])
+
+# Inspect
+df.head()
+```
+
+That looks better. I'll now proceed with cleaning the actual text data to remove unnecessary characters contained in the tweet.
+
+First, I create a function utilizing the re (regex) library to remove the irrelevant content from the tweet (e.g. twitter handles and mentions, included links, non-letter characters). I then apply this function to each value in the "tweets" column of the dataframe.
+
+```{python}
+# Clean tweets
+def process_tweets(t):
+    t = t.lower()
+    t = re.sub("rt ", "", t)            # remove "rt", a term automatically left in if the tweet is a retweet
+    t = re.sub("@[A-Za-z0-9]+", "", t) # remove handles
+    t = re.sub("#[A-Za-z0-9]+", "", t) # remove hashtags
+    t = re.sub(r"http\S+", "", t)      # remove links (anything that doesn't have a space after http)
+    t = re.sub(r"www.\S+", "", t)      # remove links
+    t = re.sub("[()!?]", "", t)        # remove punctuation
+    t = re.sub("\[.*?\]", "", t)       # remove puncutation
+    t = re.sub("[^a-z]", " ", t)       # remove anything that is not a letter
+    return t
+
+# Apply function to tweets
+df["tweets"] = df["tweets"].apply(process_tweets)
+```
+
+Now we can look at the cleaned text data, sorted by number of retweets to get a better sense of what people are tweeting about our topi.
+
+```{python}
+# Inspect tweets with most retweets
+retweets = df.sort_values(by=["retweet_count"], ascending=False)
+
+# Print 10 top most retweeted tweets
+retweets[["tweets", "retweet_count"]][0:10]
+```
+
+## *4) Load*
+### SQL Database
+
+Next, I use SQLite to create a local SQL database (i.e. on my computer in the same folder as this file). I'll also create a table called "queried_tweets.db" to store the tweets data contained in pandas dataframe "df". 
+
+```{python}
+# Create db and save as a SQLlite table
+%reload_ext sql
+%sql sqlite:///queried_tweets.db
+c = sqlite3.connect("queried_tweets.db")
+cur = c.cursor()
+df.to_sql("tweets_table", con=c, if_exists="replace")
+```
+
+Here I test to ensure that I can access the new SQL database using SQL queries.
+
+```{python}
+%%sql
+SELECT * 
+FROM tweets_table
+LIMIT 5;
+```
+
+This isn't especially valuable right now as I also have the pandas dataframe loaded. However, if I had thousands or millions of tweets to work with and a team of data analysts, this would allow us to leverage more complex SQL queries to efficiently extract different subsets of data from a centralized database.
+
+I also could modify the query so that instead of "replacing" the table, I simply add more records instead. This would be useful if we wanted to measure sentiment over time, stream tweets in real-time, or were interested in analysis required a larger number of tweets.
+
+
+### AWS - S3 Bucket
+
+Additionally, a more-modern solution would be to upload this data to a cloud storage provider like AWS. As an example, I'll demonstrate how to upload the pandas dataframe containing the tweets data to an S3 bucket (as a csv). I could also combine the SQL & AWS loading methods to create and add to a SQL database hosted on AWS. For now though, I'll stick with a S3 bucket.
+
+```{python}
+# Set today equal today's date
+today = date.today()
+
+# Create file name
+tweet_file = "clean_tweets_" + today.strftime('%m-%d-%Y') + ".csv"
+
+# Specify bucket & region
+s3_bucket_name = 'twitter-api-project'
+aws_region_name = 'us-east-1'
+
+# Initialize S3 client
+s3_client = boto3.client('s3', 
+                        region_name = aws_region_name,
+                        aws_access_key_id = AWS_ACCESS_KEY_ID,
+                        aws_secret_access_key = AWS_SECRET_ACCESS_KEY)
+
+# Write dataframe to S3
+with io.StringIO() as csv_buffer:
+    
+    # Convert to CSV
+    df.to_csv(csv_buffer, index = False)
+    
+    # Upload file to bucket
+    response = s3_client.put_object (
+        Bucket = s3_bucket_name, 
+        Key = tweet_file, 
+        Body = csv_buffer.getvalue()
+        )
+    
+    # Get response
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    
+    # Print response for confirmation
+    if status == 200:
+        print(f"Successful S3 put_object response. Status - {status}")
+    
+    else:
+        print(f"Unsuccessful S3 put_object response. Status - {status}")
+```
+
+As the expected 200 response shows, I have now successfully uploaded the tweets data to S3. 
+
+Here's a screenshot of my AWS account:
+
+![Extracted tweet data now on S3](s3-screenshot.png)
+
+[Download the CSV file here](clean_tweets_01-27-2023.csv) to see for yourself
+
+## *5) Analytics*
+
+### Wordcloud
+
+For the final component of this project, I will now execute various methods of sentiment analysis to demonstrate the how to analyze unlabeled, unstructured text data.
+
+A simple form of text analysis is to display a simple wordcloud, which shows a visual representation of the most commons words from the processed tweets column.
+
+Note that prior to creating the wordcloud, I use the stopwords library to set the list of words to exclude.
+
+```{python}
+# Set stopwords
+#nltk.download('stopwords')
+sw = stopwords.words("english")
+
+# Append non-useful words to stopwords list
+appended_stopwords = ["usmnt", "would", "u", "soccer", "one", "us", "get"]
+sw.extend(appended_stopwords)
+
+# Build wordcloud of word freqs in query
+wc = WordCloud(stopwords=sw).generate(" ".join(df["tweets"]))
+plt.axis("off")
+plt.imshow(wc)
+plt.show()
+```
+
+### Vectorize
+
+The vectorizer below transforms the column of clean tweets into a vector of most common words. I first convert the newly vectorized column into a dataframe, then transpose it into a term-tweet matrix. Finally, I add a column with a count of how many times each term was mentioned in the list of tweets, then print the sorted results.
+
+```{python}
+# Initialize vectorizer
+v = CountVectorizer(stop_words=sw)
+
+# Vectorize tweets column
+v_tweets = v.fit_transform(df["tweets"])
+
+# Convert vectorized tweets into dataframe
+v_tweets_df = pd.DataFrame(v_tweets.toarray(),
+                          columns=v.get_feature_names_out(),
+                          index=df["tweet_id"])
+
+# Transpose it to get a term-tweet matrix
+v_tweets_df = v_tweets_df.T
+
+# Calculate frequencies of tweets for each term (row)
+v_tweets_df["freq"] = v_tweets_df.sum(axis=1)
+
+# Inspect new tweets
+v_tweets_df["freq"].sort_values(ascending=False)
+```
+
+```{python}
+# Make term into a column, select freq and term columns 
+v_tweets_df["term"] = v_tweets_df.index
+v_tweets_df = v_tweets_df[["freq", "term"]]
+
+# Keep top 30 most frequent terms
+v_top = v_tweets_df.sort_values(by="freq", ascending=False)[:30]
+
+# Plot terms by frequency
+alt.Chart(v_top).mark_bar().encode(alt.X("term", sort="-y"),
+                                    y="freq")
+```
+
+### TextBlob Sentiment Analysis
+
+In the code below, I leverage the TextBlob library to calculate two types of sentiment scores for each tweet: 
+- Polarity (positive = 1, negative = -1) 
+- Subjectivity score (completely subjective = 1, completely objective = 0)
+
+```{python}
+# Initialize empty vector to score polarity & subjectivity scores
+polarity = []
+subjectivity = []
+
+# Loop through and extract sentiment/polarity of each tweet
+for i in df['tweets']:
+
+    # Get sample polarity & subjectivity scores
+    sample = TextBlob(i)
+    
+    # Append scores to associated vecotrs
+    polarity.append(sample.sentiment[0])
+    subjectivity.append(sample.sentiment[1])
+    
+    
+# Add columns to the dataframe
+df["polarity"] = polarity
+df["subjectivity"] = subjectivity
+
+# Inspect results
+df
+```
+
+Additionally, I can now create custom sentiment labels (and therefore sentiment categories for my set of tweets) based on the polarity score. I do this by marking any score below 0 as negative and any score as above 0 as positive. Alternative scoring calculations could be used here as well depending (e.g. Neutral could extend from -0.10 to 0.10 or -0.05 to 0.05). This might be preferrable if you only wanted to see highly negative tweets related to a new feature or open defect that has been discovered with a product. Another option would be to create more labels like "Strongly positive", "Strongly negative", etc.
+
+```{python}
+# Create sentiment groups based on polarity scores
+df["pol_group"] = np.where(df["polarity"] > 0, "Positive",
+                          np.where(df["polarity"] < 0, "Negative", "Neutral"))
+
+
+# Inspect the results more closely
+df_sent = df[["tweets", "pol_group", "polarity", "subjectivity"]]
+df_sent
+```
+
+### Transformers Sentiment Analysis
+
+Using sentiment labeling for TextBlob not always the most accurate method (as we can see). I'll now try an alternative approach using the transformers library.
+
+Transformers uses pre-trained models from the most popular Python deep learning/machine learning libraries: Tensorflow, PyTorch, and Jax. I can apply these robust, well-developed models to my dataset of tweets via a process called transfer learning. 
+
+For this example, I will apply the model to an unlabeled sentiment analysis task (i.e. calculate the sentiment of the tweets contained in my dataframe). I'll use distilBERT base uncased finetuned SST-2 model. This is one of the most widely-used, most accurate, and fastest sentiment analysis models available for this type of work.
+
+More information regarding the model can be found on Hugging Face [here](https://huggingface.co/distilbert-base-uncased-finetuned-sst-2-english)
+
+```{python}
+model = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+```
+
+```{python}
+# Create empty vector for sentiment scores
+sent_label = []
+sent_confidence = []
+
+# Apply model and extract sentiment labels/scores
+for i in df_sent["tweets"]:
+    sample = model(i)
+    sent_label.append(sample[0]["label"])
+    sent_confidence.append(sample[0]["score"])
+
+# Append columns to df
+df_sent["sent_label"] = sent_label
+df_sent["sent_confidence"] = sent_confidence
+```
+
+```{python}
+# Inspect results (different rows this time)
+df_sent.iloc[40:60]
+```
+
+The labels appear to be a bit more accurate, although not perfect given the irregular ways in which people communicate via Twitter. The text is not nearly as clean or straightforward as a product review or an industry report, so it makes since that the model would have a more difficult time parsing and correcting classifying each tweet.
+
+As a last step, I'll create a final iteration of the dataframe and plot the results to make reviewing the sentiment analysis scores a bit easier.
+
+```{python}
+pd.crosstab(df_sent["sent_label"], columns="index", normalize=True)
+```
+
+```{python}
+# Drop columns I don't need 
+df_clean = df_sent.drop(columns=["pol_group", "subjectivity"])
+
+# Sort and color by TextBlob score
+df_clean.sort_values(by="polarity").style.background_gradient(cmap="coolwarm", 
+                                                              subset = ["polarity"])
+```
+
+## Conclusions
+
+The steps I have walked through show how easy it can be to pull unstructured text data from an API, clean and process the data, transform it into a form that can be analyzed, then execute several variations of unlabeled sentiment analysis. Thanks to the open-source nature of web development, the libraries I leveraged allowed me to quickly perform these operations with relatively few lines of code.
+
+The primary challenge in this work, however, is not running the code to apply sentiment scores or create visualizations, but in actually designing the data pipeline from the Twitter API to the models you want to run. As we can observe from some of the less accurate sentiment scores, text data (especially Twitter text data) is quite messy and difficult to analyze cleanly.
+
+If done correctly however, this type of analysis offers incredible insights. Inquiries to customer service teams could be automatically labeled, grouped and prioritized according to their sentiment and topic-modeling results (another similar method of text analysis). Similarly, product and marketing teams could use these techniques to better understand their customers and help drive product strategy (i.e. what do we build next, what do our customers want to see). 
+
+In my next post on this topic, I plan to bundle sentiment analysis code into a streamlit app. This would allow anyone to enter a term and see the resulting twitter sentiment analysis based on the most recent tweets. 
+
+Thanks for reading!
+
